@@ -5,6 +5,7 @@ The OMDb API (Open Movie Database) provides IMDB rating data
 using IMDB IDs (tt... format).
 """
 
+import asyncio
 import aiohttp
 from api_service.services.http.base_client import BaseHTTPClient
 from api_service.config.logger_manager import LoggerManager
@@ -32,12 +33,13 @@ class OmdbClient(BaseHTTPClient):
         self.base_url = "https://www.omdbapi.com/"
         self.logger.debug("OmdbClient initialized")
 
-    async def get_rating(self, imdb_id):
+    async def get_rating(self, imdb_id, strict=False):
         """
         Fetch IMDB rating and vote count for a given IMDB ID.
 
         Args:
             imdb_id (str): IMDB ID in tt... format (e.g., 'tt0816692').
+            strict (bool): Raise a sanitized error on outages, invalid keys or quotas.
 
         Returns:
             dict | None: Dictionary with 'imdb_rating' (float) and
@@ -57,6 +59,8 @@ class OmdbClient(BaseHTTPClient):
                     data = await response.json()
 
                     if data.get('Response') == 'False':
+                        if strict and data.get('Error') != 'Movie not found!':
+                            raise ValueError("IMDb lookup failed. Check the OMDb API key and daily quota.")
                         self.logger.debug("OMDb returned no result for IMDB ID %s: %s",
                                           imdb_id, data.get('Error'))
                         return None
@@ -112,9 +116,13 @@ class OmdbClient(BaseHTTPClient):
                             'imdb_rating_raw': raw_rating,
                         }
                 else:
+                    if strict:
+                        raise ValueError("IMDb lookup unavailable. Check the OMDb connection and quota.")
                     self.logger.warning("OMDb request failed for IMDB ID %s: HTTP %d",
                                         imdb_id, response.status)
-        except aiohttp.ClientError as e:
-            self.logger.error("OMDb request error for IMDB ID %s: %s", imdb_id, str(e))
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if strict:
+                raise ValueError("IMDb lookup timed out or could not connect. Please retry.") from None
+            self.logger.error("OMDb request error for IMDB ID %s: %s", imdb_id, type(e).__name__)
 
         return None

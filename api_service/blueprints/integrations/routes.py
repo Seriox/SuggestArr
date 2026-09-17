@@ -34,7 +34,7 @@ def _jellyfin_auth_headers() -> dict[str, str]:
     return {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "X-Emby-Authorization": (
+        "Authorization": (
             'MediaBrowser Client="SuggestArr", Device="SuggestArr", '
             'DeviceId="suggestarr", Version="1.0.0"'
         ),

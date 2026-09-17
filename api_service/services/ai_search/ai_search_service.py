@@ -16,6 +16,7 @@ from api_service.services.llm.llm_service import (
     interpret_search_query,
 )
 from api_service.services.tmdb.tmdb_client import TMDbClient
+from api_service.services.ai_search.watched_history import fetch_watched_history
 
 logger = LoggerManager.get_logger("AiSearchService")
 
@@ -57,6 +58,8 @@ class AiSearchService:
         use_history: bool = True,
         exclude_watched: bool = True,
         exclude_seen: bool = False,
+        entire_watch_history: bool = False,
+        imdb_filter: Optional[Dict] = None,
     ) -> Dict[str, Any]:
         """Execute an AI-powered search.
 
@@ -66,16 +69,36 @@ class AiSearchService:
         :param max_results: Maximum number of results to return.
         :param use_history: Whether to fetch and pass viewing history to the LLM.
         :param exclude_watched: Whether to exclude already-watched titles from results.
+        :param entire_watch_history: Use all played Jellyfin/Emby items for exclusion.
+        :param imdb_filter: Optional per-search minimum rating and vote thresholds.
         :return: Dict with 'results', 'ai_reasoning', and 'total'.
         """
+        self.config = dict(self.config)
+        if imdb_filter is not None:
+            self.config.update({
+                "FILTER_RATING_SOURCE": "imdb",
+                "FILTER_IMDB_THRESHOLD": round(imdb_filter["min_rating"] * 10),
+                "FILTER_IMDB_MIN_VOTES": imdb_filter["min_votes"],
+                "FILTER_INCLUDE_NO_RATING": False,
+            })
+        if (self.config.get("FILTER_RATING_SOURCE") in ("imdb", "both")
+                and not self.config.get("OMDB_API_KEY")):
+            raise ValueError("IMDb filtering requires an OMDb API key in Services / OMDb.")
+        watched_history = None
+        if exclude_watched and entire_watch_history:
+            # Once per request, shared by movie and TV searches. Never sent to the LLM.
+            watched_history = await fetch_watched_history(self.config, user_ids)
+
         if media_type == "both":
             movie_task = self._search_single(
                 query, "movie", user_ids, max_results, use_history, exclude_watched, exclude_seen,
                 record_seen=False,
+                watched_history=watched_history,
             )
             tv_task = self._search_single(
                 query, "tv", user_ids, max_results, use_history, exclude_watched, exclude_seen,
                 record_seen=False,
+                watched_history=watched_history,
             )
             movie_res, tv_res = await asyncio.gather(movie_task, tv_task)
 
@@ -106,7 +129,10 @@ class AiSearchService:
                 "total": len(final_results),
             }
 
-        return await self._search_single(query, media_type, user_ids, max_results, use_history, exclude_watched, exclude_seen)
+        return await self._search_single(
+            query, media_type, user_ids, max_results, use_history, exclude_watched,
+            exclude_seen, watched_history=watched_history,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -122,11 +148,12 @@ class AiSearchService:
         exclude_watched: bool = True,
         exclude_seen: bool = False,
         record_seen: bool = True,
+        watched_history=None,
     ) -> Dict[str, Any]:
         """Run the full search pipeline for a single media type."""
         # 1. Fetch history (best-effort — never crash the search if unavailable)
         history: List[Dict] = []
-        if use_history:
+        if use_history or (exclude_watched and watched_history is None):
             try:
                 history = await self._get_history(user_ids)
             except Exception as exc:
@@ -136,6 +163,8 @@ class AiSearchService:
             (item.get("title") or item.get("name") or "").strip().lower()
             for item in history
         }
+        if watched_history is not None:
+            watched_titles = set()  # Complete ID-aware matching replaces fuzzy title matching.
 
         # 2. Fetch already-requested TMDB IDs to exclude from results (best-effort)
         already_requested: set = set()
@@ -163,7 +192,7 @@ class AiSearchService:
         # filtering; ask for slightly more than needed to absorb TMDB lookup misses.
         llm_suggestions_count = max(max_results, 12)
         interpretation = await interpret_search_query(
-            query, history, media_type, max_suggestions=llm_suggestions_count,
+            query, history if use_history else [], media_type, max_suggestions=llm_suggestions_count,
             liked_titles=liked_titles,
         )
         ai_reasoning = self._build_ai_reasoning(interpretation)
@@ -208,6 +237,19 @@ class AiSearchService:
                 for _, result in resolved_references
             ]
             similar_result_groups: List[List[Dict]] = list(await asyncio.gather(*similar_tasks))
+
+            if watched_history is not None or tmdb_client.rating_source in ("imdb", "both"):
+                # Keep HTTP clients open until all rating/ID lookups are complete.
+                candidates = title_results + [i for group in similar_result_groups for i in group]
+                allowed = await self._filter_external_candidates(
+                    candidates, media_type, tmdb_client, watched_history,
+                    already_requested, watched_titles if exclude_watched else set(),
+                )
+                title_results = [i if i and i.get("id") in allowed else None for i in title_results]
+                similar_result_groups = [
+                    [i for i in group if i.get("id") in allowed]
+                    for group in similar_result_groups
+                ]
 
         # 6. Build result list: AI suggestions only, filtered & deduped
         seen_ids: set = set()
@@ -499,7 +541,8 @@ class AiSearchService:
         )
 
         async with client:
-            # Determine which users to query
+            # Respect the linked account (route) or explicitly configured users.
+            user_ids = user_ids or self.config.get("SELECTED_USERS")
             if user_ids:
                 users = [
                     u if isinstance(u, dict) else {"id": u, "name": str(u)}
@@ -574,6 +617,59 @@ class AiSearchService:
                     history.append({"title": title, "year": year, "type": media_type})
 
             return history
+
+    async def _filter_external_candidates(
+        self, candidates, media_type, client, watched_history, requested, watched_titles,
+    ):
+        """Apply complete-history and IMDb checks once per unique candidate.
+
+        Bounded concurrency prevents bursts against TMDb/OMDb. IMDb values are
+        kept separate from TMDb ratings; missing values never pass a strict
+        per-search IMDb filter. No additional LLM requests are made here.
+        """
+        check_imdb = client.rating_source in ("imdb", "both")
+        if check_imdb and not client.omdb_client:
+            raise ValueError("IMDb filtering requires an OMDb API key in Services / OMDb.")
+        semaphore = asyncio.Semaphore(4)
+        unique = {item["id"]: item for item in candidates if item and item.get("id")}
+
+        async def check(item):
+            """Reject locally before spending requests on external metadata."""
+            if (str(item["id"]) in requested or self._is_watched(item, watched_titles)
+                    or not client._apply_filters(item, media_type)["passed"]):
+                return False
+            if watched_history is not None and watched_history.contains(item, media_type):
+                return False
+            async with semaphore:
+                if check_imdb or (watched_history is not None and watched_history.has_imdb_ids):
+                    details = await client._get_item_details(item["id"], media_type)
+                    if not details:
+                        raise ValueError("Could not verify TMDb metadata; please retry the search.")
+                    item["imdb_id"] = details.get("imdb_id")
+                if watched_history is not None and watched_history.contains(item, media_type):
+                    return False
+                if check_imdb:
+                    data = await client.omdb_client.get_rating(item.get("imdb_id"), strict=True)
+                    rating = data.get("imdb_rating") if data else None
+                    votes = data.get("imdb_votes") if data else None
+                    if rating is None:
+                        return client.include_no_ratings
+                    if rating < client.imdb_threshold / 10:
+                        return False
+                    if client.imdb_min_votes > 0 and (votes is None or votes < client.imdb_min_votes):
+                        return False
+                    item["imdb_rating"], item["imdb_votes"] = rating, votes
+                return True
+
+        passed = await asyncio.gather(*(check(item) for item in unique.values()))
+        allowed = {item_id for item_id, ok in zip(unique, passed) if ok}
+        # Duplicate candidates can be different dictionaries (search vs similar).
+        for item in candidates:
+            if item and item.get("id") in allowed:
+                for key in ("imdb_id", "imdb_rating", "imdb_votes"):
+                    if key in unique[item["id"]]:
+                        item[key] = unique[item["id"]][key]
+        return allowed
 
     def _make_tmdb_client(self) -> TMDbClient:
         """Instantiate TMDbClient from the current configuration."""

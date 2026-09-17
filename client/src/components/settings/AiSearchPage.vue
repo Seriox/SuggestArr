@@ -83,11 +83,33 @@
           <label class="toggle-option">
             <span class="toggle-label">
               <span class="toggle-title"><i class="fas fa-eye-slash"></i>Exclude already watched</span>
-              <span class="toggle-hint">Hide titles you've already seen from results</span>
+              <span class="toggle-hint">Hide watched titles; enable entire history below to include older watches</span>
             </span>
             <div class="toggle-switch" :class="{ on: excludeWatched }" @click="excludeWatched = !excludeWatched">
               <div class="toggle-knob"></div>
             </div>
+          </label>
+          <label class="toggle-option">
+            <span class="toggle-label">
+              <span class="toggle-title"><i class="fas fa-history"></i>Use entire watch history</span>
+              <span class="toggle-hint">Exclude all watched movies and started series in Jellyfin/Emby, not just recent watches. History stays on this server.</span>
+            </span>
+            <input v-model="entireWatchHistory" type="checkbox" :disabled="!excludeWatched || isSearching" />
+          </label>
+          <label class="toggle-option">
+            <span class="toggle-label">
+              <span class="toggle-title"><i class="fas fa-star"></i>Filter by IMDb rating</span>
+              <span class="toggle-hint">Requires an OMDb API key in Services. Unrated titles are excluded. When disabled, global rating settings apply.</span>
+            </span>
+            <input v-model="filterImdb" type="checkbox" :disabled="isSearching" />
+          </label>
+          <label v-if="filterImdb" class="number-option">
+            <span class="toggle-label"><span class="toggle-title">Minimum IMDb rating (0–10)</span></span>
+            <input v-model.number="imdbMinRating" type="number" min="0" max="10" step="0.1" class="number-input" :disabled="isSearching" />
+          </label>
+          <label v-if="filterImdb" class="number-option">
+            <span class="toggle-label"><span class="toggle-title">Minimum IMDb votes</span></span>
+            <input v-model.number="imdbMinVotes" type="number" min="0" max="100000000" step="100" class="number-input" :disabled="isSearching" />
           </label>
           <label class="toggle-option">
             <span class="toggle-label">
@@ -202,8 +224,8 @@
             <div class="card-title card-title-clickable" @click="openModal(item)">{{ item.title }}</div>
             <div class="card-meta">
               <span v-if="releaseYear(item)" class="meta-year">{{ releaseYear(item) }}</span>
-              <span v-if="item.rating" class="meta-rating">
-                <i class="fas fa-star"></i> {{ Number(item.rating).toFixed(1) }}
+              <span v-if="item.imdb_rating != null || item.rating" class="meta-rating">
+                <i class="fas fa-star"></i> {{ Number(item.imdb_rating ?? item.rating).toFixed(1) }} {{ item.imdb_rating != null ? 'IMDb' : 'TMDb' }}
                 <span v-if="item.votes" class="meta-votes">({{ formatVotes(item.votes) }})</span>
               </span>
               <span class="meta-type">{{ item.media_type === 'tv' ? 'TV' : 'Movie' }}</span>
@@ -285,9 +307,9 @@
                     <i :class="selectedItem.media_type === 'movie' ? 'fas fa-film' : 'fas fa-tv'"></i>
                     {{ selectedItem.media_type === 'tv' ? 'TV SHOW' : 'MOVIE' }}
                   </span>
-                  <span v-if="selectedItem.rating" class="ai-badge ai-badge-rating">
+                  <span v-if="selectedItem.imdb_rating != null || selectedItem.rating" class="ai-badge ai-badge-rating">
                     <i class="fas fa-star"></i>
-                    {{ Number(selectedItem.rating).toFixed(1) }}
+                    {{ Number(selectedItem.imdb_rating ?? selectedItem.rating).toFixed(1) }} {{ selectedItem.imdb_rating != null ? 'IMDb' : 'TMDb' }}
                     <span v-if="selectedItem.votes" class="ai-badge-votes">· {{ formatVotes(selectedItem.votes) }}</span>
                   </span>
                   <span v-if="releaseYear(selectedItem)" class="ai-badge ai-badge-date">
@@ -362,6 +384,10 @@ export default {
       showAdvanced: false,
       useHistory: true,
       excludeWatched: true,
+      entireWatchHistory: localStorage.getItem('suggestarr_ai_entire_history') !== 'false',
+      filterImdb: localStorage.getItem('suggestarr_ai_filter_imdb') === 'true',
+      imdbMinRating: Number(localStorage.getItem('suggestarr_ai_imdb_rating') ?? 7),
+      imdbMinVotes: Number(localStorage.getItem('suggestarr_ai_imdb_votes') ?? 1000),
       maxResults: 12,
       // Recent search history (persisted in localStorage)
       feedbackMap: {},
@@ -372,6 +398,10 @@ export default {
   },
 
   watch: {
+    entireWatchHistory(value) { localStorage.setItem('suggestarr_ai_entire_history', String(value)); },
+    filterImdb(value) { localStorage.setItem('suggestarr_ai_filter_imdb', String(value)); },
+    imdbMinRating(value) { localStorage.setItem('suggestarr_ai_imdb_rating', String(value)); },
+    imdbMinVotes(value) { localStorage.setItem('suggestarr_ai_imdb_votes', String(value)); },
     excludeSeen(val) {
       localStorage.setItem('suggestarr_ai_exclude_seen', JSON.stringify(!!val));
     },
@@ -504,7 +534,12 @@ export default {
       this.queryInterpretation = null;
 
       try {
-        const res = await aiSearch(this.query.trim(), this.mediaType, [], this.maxResults, this.useHistory, this.excludeWatched, this.excludeSeen);
+        const res = await aiSearch(this.query.trim(), this.mediaType, [], this.maxResults, this.useHistory, this.excludeWatched, this.excludeSeen, {
+          entireWatchHistory: this.entireWatchHistory,
+          filterImdb: this.filterImdb,
+          imdbMinRating: this.imdbMinRating,
+          imdbMinVotes: this.imdbMinVotes,
+        });
         const data = res.data;
 
         if (data.status === 'error') {
