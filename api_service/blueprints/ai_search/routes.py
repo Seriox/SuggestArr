@@ -3,9 +3,10 @@ AI Search blueprint — semantic movie/TV search powered by LLM + TMDB.
 """
 
 import asyncio
+import math
 
 import aiohttp
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from api_service.auth.limiter import limiter
 from api_service.config.logger_manager import LoggerManager
@@ -16,6 +17,42 @@ from api_service.services.llm.llm_service import get_llm_client
 
 ai_search_bp = Blueprint("ai_search", __name__)
 logger = LoggerManager.get_logger("AiSearchRoute")
+
+
+def _history_users(config, requested_ids):
+    """Prefer the authenticated user's verified link; never read other users implicitly."""
+    user = getattr(g, "current_user", None)
+    provider = config.get("SELECTED_SERVICE", "").lower()
+    if user:
+        profiles = DatabaseManager().get_user_media_profiles(int(user["id"]))
+        linked = [p["external_user_id"] for p in profiles
+                  if p["provider"] == provider and p.get("verified")]
+        if linked:
+            return linked
+        if user.get("role") != "admin":
+            raise ValueError("Link your media account in My Profile to use watch history.")
+    # Admins (or deliberately auth-disabled installations) can choose server users.
+    selected = requested_ids or config.get("SELECTED_USERS") or []
+    if not isinstance(selected, list) or not selected:
+        raise ValueError("Select media users in Services or link your account in My Profile.")
+    if any(not isinstance(u, (str, dict)) or not (u.get("id") if isinstance(u, dict) else u)
+           for u in selected):
+        raise ValueError("Invalid media user selection.")
+    return selected
+
+
+def _imdb_filter_options(data):
+    """Validate thresholds before any paid AI requests; IMDb uses a 0–10 scale."""
+    if not data.get("filter_imdb", False):
+        return None
+    rating = data.get("imdb_min_rating", 7.0)
+    votes = data.get("imdb_min_votes", 1000)
+    if (isinstance(rating, bool) or not isinstance(rating, (int, float))
+            or not math.isfinite(rating) or not 0 <= rating <= 10):
+        raise ValueError("IMDb minimum rating must be a number between 0 and 10.")
+    if isinstance(votes, bool) or not isinstance(votes, int) or not 0 <= votes <= 100000000:
+        raise ValueError("IMDb minimum votes must be a non-negative integer (up to 100000000).")
+    return {"min_rating": rating, "min_votes": votes}
 
 
 @ai_search_bp.route("/query", methods=["POST"])
@@ -44,6 +81,13 @@ async def ai_search_query():
 
         user_ids = data.get("user_ids") or []
         max_results = int(data.get("max_results") or 12)
+        if not 1 <= max_results <= 24:
+            raise ValueError("max_results must be between 1 and 24.")
+        for option in ("entire_watch_history", "filter_imdb"):
+            if option in data and not isinstance(data[option], bool):
+                raise ValueError(f"{option} must be a boolean.")
+        entire_watch_history = data.get("entire_watch_history", False)
+        imdb_filter = _imdb_filter_options(data)
         use_history = data.get("use_history", True)
         if not isinstance(use_history, bool):
             use_history = True
@@ -67,6 +111,8 @@ async def ai_search_query():
             }), 400
 
         service = AiSearchService()
+        if use_history or exclude_watched:
+            user_ids = _history_users(service.config, user_ids)
         result = await service.search(
             query=query,
             media_type=media_type,
@@ -75,6 +121,8 @@ async def ai_search_query():
             use_history=use_history,
             exclude_watched=exclude_watched,
             exclude_seen=exclude_seen,
+            entire_watch_history=entire_watch_history,
+            imdb_filter=imdb_filter,
         )
 
         return jsonify({
@@ -84,6 +132,8 @@ async def ai_search_query():
             "total": result.get("total", 0),
         }), 200
 
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
     except Exception as exc:
         logger.error("Error during AI search query: %s", str(exc))
         return jsonify({"status": "error", "message": f"Search failed: {str(exc)}"}), 500
